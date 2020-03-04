@@ -35,6 +35,7 @@ import tensorflow as tf
 
 from ml_metadata.metadata_store import metadata_store
 from ml_metadata.proto import metadata_store_pb2
+from ml_metadata.proto import metadata_store_service_pb2
 from tensorflow.python.lib.io import file_io  # pylint: disable=g-direct-tensorflow-import
 from tfx.orchestration import data_types
 from tfx.types import artifact_utils
@@ -269,6 +270,77 @@ class Metadata(object):
           self._get_artifact_state(a) == ArtifactState.PUBLISHED
       ]
     return result
+
+  def _get_artifact_type(self, type_name: Text):
+    """Gets artifact type given type name. Return None if there is no type."""
+    artifact_type = None
+    while artifact_type is None:
+      try:
+        artifact_type = self.store.get_artifact_type(type_name)
+      except (tf.errors.NotFoundError, tf.errors.InternalError) as e:
+        if isinstance(e, tf.errors.NotFoundError):
+          break
+        else:
+          continue
+    return artifact_type
+
+  def get_qualified_artifacts(
+      self,
+      context: metadata_store_pb2.Context,
+      type_name: Text,
+      producer_component_id: Optional[Text] = None,
+      output_key: Optional[Text] = None,
+  ) -> List[metadata_store_service_pb2.ArtifactAndType]:
+    """Gets qualified artifacts that have the right producer info.
+
+    Args:
+      context: context constraint to filter artifacts
+      type_name: type constraint to filter artifacts
+      producer_component_id: producer constraint to filter artifacts
+      output_key: output key constraint to filter artifacts
+
+    Returns:
+      A list of ArtifactAndType, containing qualified artifacts.
+    """
+
+    def _execution_filter_fn(execution, component_id):
+      if component_id:
+        return execution.properties['component_id'].string_value == component_id
+      else:
+        return True
+
+    def _event_filter_fn(event, key):
+      if key:
+        assert len(event.path.steps) == 2, 'Event must have two path steps.'
+        return event.type == metadata_store_pb2.Event.OUTPUT and event.path.steps[
+            0].key == key
+      else:
+        return event.type == metadata_store_pb2.Event.OUTPUT
+
+    artifact_type = self._get_artifact_type(type_name)
+    if not artifact_type:
+      return []
+    executions_within_context = self.store.get_executions_by_context(context.id)
+    qualified_producer_executions = [
+        e.id
+        for e in executions_within_context
+        if _execution_filter_fn(e, producer_component_id)
+    ]
+    qualified_output_events = [
+        ev for ev in self.store.get_events_by_execution_ids(
+            qualified_producer_executions) if _event_filter_fn(ev, output_key)
+    ]
+
+    candidate_artifacts = self.store.get_artifacts_by_id(
+        list(set(ev.artifact_id for ev in qualified_output_events)))
+    qualified_artifacts = [
+        a for a in candidate_artifacts if a.type_id == artifact_type.id and
+        self._get_artifact_state(a) == ArtifactState.PUBLISHED
+    ]
+    return [
+        metadata_store_service_pb2.ArtifactAndType(
+            artifact=a, type=artifact_type) for a in qualified_artifacts
+    ]
 
   def _prepare_event(self,
                      event_type: metadata_store_pb2.Event.Type,
@@ -860,12 +932,15 @@ class Metadata(object):
     return context_type_id
 
   def _prepare_context(
-      self, context_type_name: Text, context_name: Text,
-      properties: Dict[Text, Union[int, float, Text]]
+      self,
+      context_type_name: Text,
+      context_name: Text,
+      properties: Optional[Dict[Text, Union[int, float, Text]]] = None
   ) -> metadata_store_pb2.Context:
     """Prepares a context proto."""
     # TODO(ruoyu): Centralize the type definition / mapping along with Artifact
     # property types.
+    properties = properties or {}
     property_type_mapping = {
         int: metadata_store_pb2.INT,
         six.binary_type: metadata_store_pb2.STRING,
